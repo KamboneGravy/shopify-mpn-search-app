@@ -40,14 +40,19 @@ class ShopifyGraphQLService {
   }
 
   /**
-   * Fetch all variants that have a specific metafield (paginated)
-   * 
-   * This uses productVariants query with metafield filter.
+   * Fetch products published to Online Store with their variants and MPN metafield
+   * Only indexes products that are in the Online Store sales channel
    */
   async fetchVariantsWithMetafield(namespace, key, cursor = null, limit = 50) {
+    const onlineStoreChannelId = process.env.ONLINE_STORE_CHANNEL_ID;
+    
+    if (!onlineStoreChannelId) {
+      console.warn('⚠️ ONLINE_STORE_CHANNEL_ID not set - indexing ALL variants');
+    }
+
     const query = `
-      query GetVariantsWithMPN($cursor: String, $limit: Int!, $namespace: String!, $key: String!) {
-        productVariants(first: $limit, after: $cursor) {
+      query GetProducts($cursor: String, $limit: Int!, $namespace: String!, $key: String!) {
+        products(first: $limit, after: $cursor, query: "published_status:published") {
           pageInfo {
             hasNextPage
             endCursor
@@ -56,20 +61,35 @@ class ShopifyGraphQLService {
             node {
               id
               title
-              sku
-              price
-              image {
+              handle
+              featuredImage {
                 url
               }
-              metafield(namespace: $namespace, key: $key) {
-                value
+              resourcePublicationsV2(first: 10) {
+                edges {
+                  node {
+                    publication {
+                      id
+                      name
+                    }
+                    isPublished
+                  }
+                }
               }
-              product {
-                id
-                title
-                handle
-                featuredImage {
-                  url
+              variants(first: 100) {
+                edges {
+                  node {
+                    id
+                    title
+                    sku
+                    price
+                    image {
+                      url
+                    }
+                    metafield(namespace: $namespace, key: $key) {
+                      value
+                    }
+                  }
                 }
               }
             }
@@ -85,23 +105,63 @@ class ShopifyGraphQLService {
       key
     });
 
-    const variants = data.productVariants.edges
-      .map(edge => ({
-        ...edge.node,
-        mpn: edge.node.metafield?.value || null
-      }))
-      .filter(v => v.mpn); // Only return variants that have MPN
+    // Filter to only products published on Online Store, then flatten variants
+    const variants = [];
+    
+    for (const productEdge of data.products.edges) {
+      const product = productEdge.node;
+      
+      // Check if product is published to Online Store
+      if (onlineStoreChannelId) {
+        const publications = product.resourcePublicationsV2?.edges || [];
+        const isOnlineStore = publications.some(pub => 
+          pub.node.isPublished && 
+          (pub.node.publication.name === 'Online Store' || 
+           pub.node.publication.id.includes(onlineStoreChannelId.replace('Channel', 'Publication')))
+        );
+        
+        if (!isOnlineStore) {
+          continue; // Skip products not on Online Store
+        }
+      }
+
+      for (const variantEdge of product.variants.edges) {
+        const variant = variantEdge.node;
+        const mpn = variant.metafield?.value || null;
+        
+        // Only include variants with MPN
+        if (mpn) {
+          variants.push({
+            id: variant.id,
+            title: variant.title,
+            sku: variant.sku,
+            price: variant.price,
+            image: variant.image,
+            mpn,
+            product: {
+              id: product.id,
+              title: product.title,
+              handle: product.handle,
+              featuredImage: product.featuredImage
+            }
+          });
+        }
+      }
+    }
 
     return {
       variants,
-      pageInfo: data.productVariants.pageInfo
+      pageInfo: data.products.pageInfo
     };
   }
 
   /**
    * Fetch variants for a specific product (for webhook updates)
+   * Also checks if product is published to Online Store
    */
   async fetchProductVariants(productGid, namespace, key) {
+    const onlineStoreChannelId = process.env.ONLINE_STORE_CHANNEL_ID;
+
     const query = `
       query GetProductVariants($productId: ID!, $namespace: String!, $key: String!) {
         product(id: $productId) {
@@ -110,6 +170,17 @@ class ShopifyGraphQLService {
           handle
           featuredImage {
             url
+          }
+          resourcePublicationsV2(first: 10) {
+            edges {
+              node {
+                publication {
+                  id
+                  name
+                }
+                isPublished
+              }
+            }
           }
           variants(first: 100) {
             edges {
@@ -139,6 +210,21 @@ class ShopifyGraphQLService {
 
     if (!data.product) {
       return [];
+    }
+
+    // Check if product is published to Online Store
+    if (onlineStoreChannelId) {
+      const publications = data.product.resourcePublicationsV2?.edges || [];
+      const isOnlineStore = publications.some(pub => 
+        pub.node.isPublished && 
+        (pub.node.publication.name === 'Online Store' || 
+         pub.node.publication.id.includes(onlineStoreChannelId.replace('Channel', 'Publication')))
+      );
+      
+      if (!isOnlineStore) {
+        console.log(`⏭️ Product ${productGid} not published to Online Store, skipping`);
+        return [];
+      }
     }
 
     return data.product.variants.edges.map(edge => ({
