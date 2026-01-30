@@ -1,4 +1,4 @@
-// services/shopifyGraphQL.js - Shopify GraphQL Client for Variant + Metafield Queries
+// services/shopifyGraphQL.js - Shopify GraphQL Client with Bulk Operations
 const SHOPIFY_API_VERSION = '2024-01';
 
 class ShopifyGraphQLService {
@@ -40,17 +40,13 @@ class ShopifyGraphQLService {
   }
 
   /**
-   * Fetch products published to Online Store with their variants and MPN metafield
-   * Uses onlineStoreUrl to determine if product is on Online Store (no extra scope needed)
+   * Start a bulk operation to fetch all products with variants and MPN metafield
+   * Returns the bulk operation ID
    */
-  async fetchVariantsWithMetafield(namespace, key, cursor = null, limit = 50) {
-    const query = `
-      query GetProducts($cursor: String, $limit: Int!, $namespace: String!, $key: String!) {
-        products(first: $limit, after: $cursor, query: "published_status:published") {
-          pageInfo {
-            hasNextPage
-            endCursor
-          }
+  async startBulkExport(namespace, key) {
+    const bulkQuery = `
+      {
+        products(query: "published_status:published") {
           edges {
             node {
               id
@@ -60,7 +56,7 @@ class ShopifyGraphQLService {
               featuredImage {
                 url
               }
-              variants(first: 100) {
+              variants {
                 edges {
                   node {
                     id
@@ -70,7 +66,7 @@ class ShopifyGraphQLService {
                     image {
                       url
                     }
-                    metafield(namespace: $namespace, key: $key) {
+                    metafield(namespace: "${namespace}", key: "${key}") {
                       value
                     }
                   }
@@ -82,63 +78,208 @@ class ShopifyGraphQLService {
       }
     `;
 
-    const data = await this.query(query, {
-      cursor,
-      limit,
-      namespace,
-      key
-    });
+    const mutation = `
+      mutation BulkOperationRunQuery($query: String!) {
+        bulkOperationRunQuery(query: $query) {
+          bulkOperation {
+            id
+            status
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `;
 
-    // Filter to only products with onlineStoreUrl (published to Online Store)
-    const variants = [];
-    let skippedProducts = 0;
+    const data = await this.query(mutation, { query: bulkQuery });
     
-    for (const productEdge of data.products.edges) {
-      const product = productEdge.node;
+    if (data.bulkOperationRunQuery.userErrors?.length > 0) {
+      throw new Error(`Bulk operation errors: ${JSON.stringify(data.bulkOperationRunQuery.userErrors)}`);
+    }
+
+    const bulkOp = data.bulkOperationRunQuery.bulkOperation;
+    console.log(`📦 Bulk operation started: ${bulkOp.id} (${bulkOp.status})`);
+    
+    return bulkOp.id;
+  }
+
+  /**
+   * Poll for bulk operation completion
+   * Returns the download URL when ready
+   */
+  async pollBulkOperation(bulkOperationId, onProgress) {
+    const query = `
+      query BulkOperationStatus($id: ID!) {
+        node(id: $id) {
+          ... on BulkOperation {
+            id
+            status
+            errorCode
+            objectCount
+            fileSize
+            url
+            partialDataUrl
+          }
+        }
+      }
+    `;
+
+    let attempts = 0;
+    const maxAttempts = 120; // 10 minutes max (5 sec intervals)
+
+    while (attempts < maxAttempts) {
+      const data = await this.query(query, { id: bulkOperationId });
+      const op = data.node;
+
+      if (onProgress) {
+        onProgress(op.status, op.objectCount || 0);
+      }
+
+      console.log(`📊 Bulk op status: ${op.status}, objects: ${op.objectCount || 0}`);
+
+      if (op.status === 'COMPLETED') {
+        return op.url;
+      }
+
+      if (op.status === 'FAILED') {
+        throw new Error(`Bulk operation failed: ${op.errorCode}`);
+      }
+
+      if (op.status === 'CANCELED') {
+        throw new Error('Bulk operation was canceled');
+      }
+
+      // Wait 5 seconds before polling again
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      attempts++;
+    }
+
+    throw new Error('Bulk operation timed out');
+  }
+
+  /**
+   * Download and parse the bulk operation JSONL file
+   * Returns variants filtered for Online Store and with MPN
+   */
+  async downloadAndParseBulkResults(url) {
+    console.log(`📥 Downloading bulk results...`);
+    
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to download bulk results: ${response.status}`);
+    }
+
+    const text = await response.text();
+    const lines = text.trim().split('\n');
+    
+    console.log(`📄 Processing ${lines.length} lines...`);
+
+    // Parse JSONL - Shopify returns parent/child relationships
+    // Products come first, then their variants with __parentId
+    const products = new Map();
+    const variants = [];
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
       
-      // Skip products not on Online Store (no onlineStoreUrl means not published there)
+      const obj = JSON.parse(line);
+      
+      if (obj.id?.includes('/Product/')) {
+        // This is a product
+        products.set(obj.id, {
+          id: obj.id,
+          title: obj.title,
+          handle: obj.handle,
+          onlineStoreUrl: obj.onlineStoreUrl,
+          featuredImage: obj.featuredImage
+        });
+      } else if (obj.id?.includes('/ProductVariant/')) {
+        // This is a variant
+        variants.push({
+          id: obj.id,
+          parentId: obj.__parentId,
+          title: obj.title,
+          sku: obj.sku,
+          price: obj.price,
+          image: obj.image,
+          mpn: obj.metafield?.value || null
+        });
+      }
+    }
+
+    console.log(`📦 Found ${products.size} products, ${variants.length} variants`);
+
+    // Filter: only variants where parent product has onlineStoreUrl AND variant has MPN
+    const filteredVariants = [];
+    let skippedNoOnlineStore = 0;
+    let skippedNoMpn = 0;
+
+    for (const variant of variants) {
+      const product = products.get(variant.parentId);
+      
+      if (!product) {
+        continue; // Orphan variant, skip
+      }
+
       if (!product.onlineStoreUrl) {
-        skippedProducts++;
+        skippedNoOnlineStore++;
         continue;
       }
 
-      for (const variantEdge of product.variants.edges) {
-        const variant = variantEdge.node;
-        const mpn = variant.metafield?.value || null;
-        
-        // Only include variants with MPN
-        if (mpn) {
-          variants.push({
-            id: variant.id,
-            title: variant.title,
-            sku: variant.sku,
-            price: variant.price,
-            image: variant.image,
-            mpn,
-            product: {
-              id: product.id,
-              title: product.title,
-              handle: product.handle,
-              featuredImage: product.featuredImage
-            }
-          });
-        }
+      if (!variant.mpn) {
+        skippedNoMpn++;
+        continue;
       }
+
+      filteredVariants.push({
+        id: variant.id,
+        title: variant.title,
+        sku: variant.sku,
+        price: variant.price,
+        image: variant.image,
+        mpn: variant.mpn,
+        product: {
+          id: product.id,
+          title: product.title,
+          handle: product.handle,
+          featuredImage: product.featuredImage
+        }
+      });
     }
 
-    if (skippedProducts > 0) {
-      console.log(`⏭️ Skipped ${skippedProducts} products not on Online Store`);
+    console.log(`✅ ${filteredVariants.length} variants to index`);
+    console.log(`⏭️ Skipped: ${skippedNoOnlineStore} not on Online Store, ${skippedNoMpn} no MPN`);
+
+    return filteredVariants;
+  }
+
+  /**
+   * Full bulk sync: start operation, poll, download, parse
+   * Returns array of variants ready to index
+   */
+  async bulkFetchVariants(namespace, key, onProgress) {
+    // Start the bulk operation
+    const bulkOpId = await this.startBulkExport(namespace, key);
+
+    // Poll until complete
+    const downloadUrl = await this.pollBulkOperation(bulkOpId, onProgress);
+
+    if (!downloadUrl) {
+      console.log('⚠️ Bulk operation completed but no data URL (empty result set?)');
+      return [];
     }
 
-    return {
-      variants,
-      pageInfo: data.products.pageInfo
-    };
+    // Download and parse
+    const variants = await this.downloadAndParseBulkResults(downloadUrl);
+
+    return variants;
   }
 
   /**
    * Fetch variants for a specific product (for webhook updates)
-   * Also checks if product is published to Online Store
+   * Uses regular query since it's just one product
    */
   async fetchProductVariants(productGid, namespace, key) {
     const query = `
@@ -197,26 +338,6 @@ class ShopifyGraphQLService {
         featuredImage: data.product.featuredImage
       }
     }));
-  }
-
-  /**
-   * Get total variant count (for progress tracking)
-   */
-  async getVariantCount() {
-    const query = `
-      query GetVariantCount {
-        productVariants(first: 1) {
-          totalCount
-        }
-      }
-    `;
-
-    try {
-      const data = await this.query(query);
-      return data.productVariants.totalCount || null;
-    } catch {
-      return null;
-    }
   }
 
   /**

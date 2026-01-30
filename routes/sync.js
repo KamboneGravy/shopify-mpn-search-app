@@ -1,4 +1,4 @@
-// routes/sync.js - Sync Endpoints for MPN Index
+// routes/sync.js - Sync Endpoints for MPN Index (Bulk Operations)
 const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
@@ -21,6 +21,7 @@ router.setShopifyService = (service) => {
  * POST /api/sync/full
  * 
  * Triggers a full sync of all variants with MPNs from Shopify.
+ * Uses Bulk Operations API for large catalogs.
  * This is an async operation - returns immediately with job ID.
  */
 router.post('/full', async (req, res) => {
@@ -44,7 +45,7 @@ router.post('/full', async (req, res) => {
     res.json({
       success: true,
       jobId,
-      message: 'Full sync started',
+      message: 'Full sync started (using Bulk Operations API)',
       statusUrl: `/api/sync/status/${jobId}`
     });
 
@@ -55,69 +56,59 @@ router.post('/full', async (req, res) => {
 });
 
 /**
- * Run the full sync process
+ * Run the full sync process using Bulk Operations
  */
 async function runFullSync(jobId, shop) {
-  let totalProcessed = 0;
   let totalIndexed = 0;
 
   try {
-    console.log(`📦 Job #${jobId}: Fetching variants from Shopify...`);
+    console.log(`📦 Job #${jobId}: Starting bulk export from Shopify...`);
     
-    // Clear existing index for clean sync
-    await db.clearIndex();
-    
-    // Fetch all variants with MPN metafield
     const metafieldNamespace = process.env.MPN_METAFIELD_NAMESPACE || 'custom';
     const metafieldKey = process.env.MPN_METAFIELD_KEY || 'manufacturer_item_number';
     
-    let hasNextPage = true;
-    let cursor = null;
-    let pageCount = 0;
+    // Use bulk operations to fetch all variants
+    const variants = await shopifyService.bulkFetchVariants(
+      metafieldNamespace,
+      metafieldKey,
+      (status, objectCount) => {
+        console.log(`📊 Job #${jobId}: Bulk operation ${status}, ${objectCount} objects`);
+      }
+    );
 
-    while (hasNextPage) {
-      pageCount++;
-      console.log(`📦 Job #${jobId}: Fetching page ${pageCount}...`);
-      
-      const { variants, pageInfo } = await shopifyService.fetchVariantsWithMetafield(
-        metafieldNamespace,
-        metafieldKey,
-        cursor
-      );
+    console.log(`📦 Job #${jobId}: Received ${variants.length} variants from bulk export`);
 
-      // Transform and upsert variants
-      const transformedVariants = variants.map(v => ({
-        variant_id: v.id,
-        product_id: v.product.id,
-        product_handle: v.product.handle,
-        product_title: v.product.title,
-        variant_title: v.title,
-        image_url: v.image?.url || v.product.featuredImage?.url || null,
-        mpn: v.mpn,
-        sku: v.sku,
-        price: v.price
-      }));
+    // Clear existing index before inserting new data
+    console.log(`🗑️ Job #${jobId}: Clearing existing index...`);
+    await db.clearIndex();
 
-      const { indexed, skipped } = await db.bulkUpsertVariants(transformedVariants);
-      
-      totalProcessed += variants.length;
+    // Transform and bulk insert
+    const transformedVariants = variants.map(v => ({
+      variant_id: v.id,
+      product_id: v.product.id,
+      product_handle: v.product.handle,
+      product_title: v.product.title,
+      variant_title: v.title,
+      image_url: v.image?.url || v.product.featuredImage?.url || null,
+      mpn: v.mpn,
+      sku: v.sku,
+      price: v.price
+    }));
+
+    // Insert in batches of 500
+    const batchSize = 500;
+    for (let i = 0; i < transformedVariants.length; i += batchSize) {
+      const batch = transformedVariants.slice(i, i + batchSize);
+      const { indexed } = await db.bulkUpsertVariants(batch);
       totalIndexed += indexed;
-
+      
+      console.log(`📦 Job #${jobId}: Inserted batch ${Math.floor(i / batchSize) + 1} (${totalIndexed}/${variants.length})`);
+      
       // Update job progress
       await db.updateSyncJob(jobId, {
-        processed_variants: totalProcessed,
+        processed_variants: i + batch.length,
         indexed_variants: totalIndexed
       });
-
-      console.log(`📦 Job #${jobId}: Page ${pageCount} - ${variants.length} variants (${indexed} indexed, ${skipped} skipped)`);
-
-      hasNextPage = pageInfo.hasNextPage;
-      cursor = pageInfo.endCursor;
-
-      // Small delay to avoid rate limits
-      if (hasNextPage) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
     }
 
     // Mark job complete
