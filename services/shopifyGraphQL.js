@@ -46,13 +46,12 @@ class ShopifyGraphQLService {
   async startBulkExport(namespace, key) {
     const bulkQuery = `
       {
-        products(query: "published_status:published") {
+        products {
           edges {
             node {
               id
               title
               handle
-              onlineStoreUrl
               featuredImage {
                 url
               }
@@ -161,7 +160,7 @@ class ShopifyGraphQLService {
 
   /**
    * Download and parse the bulk operation JSONL file
-   * Returns variants filtered for Online Store and with MPN
+   * Returns variants that have an MPN
    */
   async downloadAndParseBulkResults(url) {
     console.log(`📥 Downloading bulk results...`);
@@ -192,7 +191,6 @@ class ShopifyGraphQLService {
           id: obj.id,
           title: obj.title,
           handle: obj.handle,
-          onlineStoreUrl: obj.onlineStoreUrl,
           featuredImage: obj.featuredImage
         });
       } else if (obj.id?.includes('/ProductVariant/')) {
@@ -211,9 +209,8 @@ class ShopifyGraphQLService {
 
     console.log(`📦 Found ${products.size} products, ${variants.length} variants`);
 
-    // Filter: only variants where parent product has onlineStoreUrl AND variant has MPN
+    // Filter: only variants with MPN
     const filteredVariants = [];
-    let skippedNoOnlineStore = 0;
     let skippedNoMpn = 0;
 
     for (const variant of variants) {
@@ -221,11 +218,6 @@ class ShopifyGraphQLService {
       
       if (!product) {
         continue; // Orphan variant, skip
-      }
-
-      if (!product.onlineStoreUrl) {
-        skippedNoOnlineStore++;
-        continue;
       }
 
       if (!variant.mpn) {
@@ -250,7 +242,7 @@ class ShopifyGraphQLService {
     }
 
     console.log(`✅ ${filteredVariants.length} variants to index`);
-    console.log(`⏭️ Skipped: ${skippedNoOnlineStore} not on Online Store, ${skippedNoMpn} no MPN`);
+    console.log(`⏭️ Skipped: ${skippedNoMpn} variants without MPN`);
 
     return filteredVariants;
   }
@@ -279,7 +271,6 @@ class ShopifyGraphQLService {
 
   /**
    * Fetch variants for a specific product (for webhook updates)
-   * Uses regular query since it's just one product
    */
   async fetchProductVariants(productGid, namespace, key) {
     const query = `
@@ -288,7 +279,6 @@ class ShopifyGraphQLService {
           id
           title
           handle
-          onlineStoreUrl
           featuredImage {
             url
           }
@@ -319,12 +309,6 @@ class ShopifyGraphQLService {
     });
 
     if (!data.product) {
-      return [];
-    }
-
-    // If product has no onlineStoreUrl, it's not on Online Store
-    if (!data.product.onlineStoreUrl) {
-      console.log(`⏭️ Product ${productGid} not published to Online Store, skipping`);
       return [];
     }
 
