@@ -41,15 +41,9 @@ class ShopifyGraphQLService {
 
   /**
    * Fetch products published to Online Store with their variants and MPN metafield
-   * Only indexes products that are in the Online Store sales channel
+   * Uses onlineStoreUrl to determine if product is on Online Store (no extra scope needed)
    */
   async fetchVariantsWithMetafield(namespace, key, cursor = null, limit = 50) {
-    const onlineStoreChannelId = process.env.ONLINE_STORE_CHANNEL_ID;
-    
-    if (!onlineStoreChannelId) {
-      console.warn('⚠️ ONLINE_STORE_CHANNEL_ID not set - indexing ALL variants');
-    }
-
     const query = `
       query GetProducts($cursor: String, $limit: Int!, $namespace: String!, $key: String!) {
         products(first: $limit, after: $cursor, query: "published_status:published") {
@@ -62,19 +56,9 @@ class ShopifyGraphQLService {
               id
               title
               handle
+              onlineStoreUrl
               featuredImage {
                 url
-              }
-              resourcePublicationsV2(first: 10) {
-                edges {
-                  node {
-                    publication {
-                      id
-                      name
-                    }
-                    isPublished
-                  }
-                }
               }
               variants(first: 100) {
                 edges {
@@ -105,24 +89,17 @@ class ShopifyGraphQLService {
       key
     });
 
-    // Filter to only products published on Online Store, then flatten variants
+    // Filter to only products with onlineStoreUrl (published to Online Store)
     const variants = [];
+    let skippedProducts = 0;
     
     for (const productEdge of data.products.edges) {
       const product = productEdge.node;
       
-      // Check if product is published to Online Store
-      if (onlineStoreChannelId) {
-        const publications = product.resourcePublicationsV2?.edges || [];
-        const isOnlineStore = publications.some(pub => 
-          pub.node.isPublished && 
-          (pub.node.publication.name === 'Online Store' || 
-           pub.node.publication.id.includes(onlineStoreChannelId.replace('Channel', 'Publication')))
-        );
-        
-        if (!isOnlineStore) {
-          continue; // Skip products not on Online Store
-        }
+      // Skip products not on Online Store (no onlineStoreUrl means not published there)
+      if (!product.onlineStoreUrl) {
+        skippedProducts++;
+        continue;
       }
 
       for (const variantEdge of product.variants.edges) {
@@ -149,6 +126,10 @@ class ShopifyGraphQLService {
       }
     }
 
+    if (skippedProducts > 0) {
+      console.log(`⏭️ Skipped ${skippedProducts} products not on Online Store`);
+    }
+
     return {
       variants,
       pageInfo: data.products.pageInfo
@@ -160,27 +141,15 @@ class ShopifyGraphQLService {
    * Also checks if product is published to Online Store
    */
   async fetchProductVariants(productGid, namespace, key) {
-    const onlineStoreChannelId = process.env.ONLINE_STORE_CHANNEL_ID;
-
     const query = `
       query GetProductVariants($productId: ID!, $namespace: String!, $key: String!) {
         product(id: $productId) {
           id
           title
           handle
+          onlineStoreUrl
           featuredImage {
             url
-          }
-          resourcePublicationsV2(first: 10) {
-            edges {
-              node {
-                publication {
-                  id
-                  name
-                }
-                isPublished
-              }
-            }
           }
           variants(first: 100) {
             edges {
@@ -212,19 +181,10 @@ class ShopifyGraphQLService {
       return [];
     }
 
-    // Check if product is published to Online Store
-    if (onlineStoreChannelId) {
-      const publications = data.product.resourcePublicationsV2?.edges || [];
-      const isOnlineStore = publications.some(pub => 
-        pub.node.isPublished && 
-        (pub.node.publication.name === 'Online Store' || 
-         pub.node.publication.id.includes(onlineStoreChannelId.replace('Channel', 'Publication')))
-      );
-      
-      if (!isOnlineStore) {
-        console.log(`⏭️ Product ${productGid} not published to Online Store, skipping`);
-        return [];
-      }
+    // If product has no onlineStoreUrl, it's not on Online Store
+    if (!data.product.onlineStoreUrl) {
+      console.log(`⏭️ Product ${productGid} not published to Online Store, skipping`);
+      return [];
     }
 
     return data.product.variants.edges.map(edge => ({
@@ -251,8 +211,6 @@ class ShopifyGraphQLService {
       }
     `;
 
-    // Note: totalCount might not be available on all Shopify plans
-    // This is a best-effort count
     try {
       const data = await this.query(query);
       return data.productVariants.totalCount || null;
